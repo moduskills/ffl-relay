@@ -161,7 +161,7 @@ const { teamId } = await cfgRes.json();
 const [bootstrapFull, fixtures] = await Promise.all([fpl("/bootstrap-static/"), fpl("/fixtures/")]);
 const bootstrap = {
   elements: bootstrapFull.elements.map((p) => Object.fromEntries(PLAYER_FIELDS.map((f) => [f, p[f]]))),
-  teams: bootstrapFull.teams.map(({ id, name, short_name, strength }) => ({ id, name, short_name, strength })),
+  teams: bootstrapFull.teams.map(({ id, name, short_name, strength, code }) => ({ id, name, short_name, strength, code })),
   events: bootstrapFull.events.map(({ id, name, deadline_time, finished, is_current, is_next, average_entry_score }) =>
     ({ id, name, deadline_time, finished, is_current, is_next, average_entry_score })),
 };
