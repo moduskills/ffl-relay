@@ -103,8 +103,12 @@ async function fetchMyTeam(teamId) {
     });
     await email.fill(process.env.FPL_EMAIL);
     await page.locator('input[type="password"]').first().fill(process.env.FPL_PASS);
-    const allow = page.locator('button:has-text("Allow All"), #onetrust-accept-btn-handler').first();
-    if (await allow.isVisible().catch(() => false)) { await allow.click().catch(() => {}); await page.waitForTimeout(800); }
+    // the OneTrust banner renders async and intercepts clicks — accept it if it
+    // shows up, then remove the whole overlay to be safe
+    const allow = page.locator("#onetrust-accept-btn-handler").first();
+    await allow.waitFor({ timeout: 5000 }).catch(() => {});
+    if (await allow.isVisible().catch(() => false)) { await allow.click().catch(() => {}); await page.waitForTimeout(500); }
+    await page.evaluate(() => document.getElementById("onetrust-consent-sdk")?.remove()).catch(() => {});
     await page.locator('button.button--filled:has-text("Sign In")').first().click();
 
     for (let i = 0; i < 60 && !authCode; i++) await page.waitForTimeout(500);
