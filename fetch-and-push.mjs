@@ -59,6 +59,54 @@ async function fetchUnderstat(season) {
   };
 }
 
+// Authenticated FPL fetch: headless login via the account.premierleague.com
+// OAuth flow, then /my-team/ with the SPA's bearer token. This is the only way
+// to see the CURRENT squad (incl. preseason drafts and pre-deadline transfers);
+// the public picks API only shows gameweeks already locked in.
+async function fetchMyTeam(teamId) {
+  if (!process.env.FPL_EMAIL || !process.env.FPL_PASS || !teamId) return null;
+  const { chromium } = await import("playwright");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const ctx = await browser.newContext({ userAgent: UA["User-Agent"] + " Chrome/126.0 Safari/537.36" });
+    const page = await ctx.newPage();
+    await page.goto("https://fantasy.premierleague.com/", { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(2500);
+    for (const sel of ['button:has-text("Accept All Cookies")', "#onetrust-accept-btn-handler"]) {
+      const b = page.locator(sel).first();
+      if (await b.isVisible().catch(() => false)) { await b.click().catch(() => {}); break; }
+    }
+    const signIn = page.locator('a:has-text("Sign In"), button:has-text("Sign In")').first();
+    if (await signIn.isVisible().catch(() => false)) await signIn.click();
+    const email = page.locator('input[type="email"], input[name="username"], input[id*="email" i]').first();
+    await email.waitFor({ timeout: 20000 });
+    await email.fill(process.env.FPL_EMAIL);
+    await page.locator('input[type="password"]').first().fill(process.env.FPL_PASS);
+    const allow = page.locator('button:has-text("Allow All"), #onetrust-accept-btn-handler').first();
+    if (await allow.isVisible().catch(() => false)) { await allow.click().catch(() => {}); await page.waitForTimeout(800); }
+    await page.locator('button.button--filled:has-text("Sign In")').first().click();
+    await page.waitForURL("https://fantasy.premierleague.com/**", { timeout: 30000 });
+    await page.waitForTimeout(4000); // SPA token exchange
+    const access = await page.evaluate(() => {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k.startsWith("oidc.user:")) {
+          try { return JSON.parse(localStorage.getItem(k)).access_token ?? null; } catch { return null; }
+        }
+      }
+      return null;
+    });
+    if (!access) throw new Error("no access token after login");
+    const res = await ctx.request.get(`${BASE}/my-team/${teamId}/`, {
+      headers: { "X-Api-Authorization": `Bearer ${access}` },
+    });
+    if (!res.ok()) throw new Error(`my-team -> ${res.status()}`);
+    return await res.json();
+  } finally {
+    await browser.close();
+  }
+}
+
 // ClubElo: team strength ratings, one CSV row per club.
 async function fetchElo() {
   const date = new Date().toISOString().slice(0, 10);
@@ -105,6 +153,7 @@ try {
 
 let entry = null;
 let picks = null;
+let myTeam = null;
 if (teamId) {
   try {
     entry = await fpl(`/entry/${teamId}/`);
@@ -119,12 +168,17 @@ if (teamId) {
   } catch (err) {
     relayErrors.push(`entry ${teamId}: ${err.message}`);
   }
+  try {
+    myTeam = await fetchMyTeam(teamId);
+  } catch (err) {
+    relayErrors.push(`my-team login: ${err.message}`);
+  }
 }
 
 const res = await fetch(`${INGEST_BASE}/ingest?key=${KEY}`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ bootstrap, fixtures, entry, picks, sources, relayErrors }),
+  body: JSON.stringify({ bootstrap, fixtures, entry, picks, myTeam, sources, relayErrors }),
 });
 const out = await res.json().catch(() => ({}));
 console.log(`ingest -> ${res.status}`, JSON.stringify(out));
