@@ -70,16 +70,22 @@ async function fetchMyTeam(teamId) {
   try {
     const ctx = await browser.newContext({ userAgent: UA["User-Agent"] + " Chrome/126.0 Safari/537.36" });
     const page = await ctx.newPage();
-    await page.goto("https://fantasy.premierleague.com/", { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(2500);
+    // /my-team forces a redirect into the account.premierleague.com login flow
+    await page.goto("https://fantasy.premierleague.com/my-team", { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.waitForTimeout(3000);
     for (const sel of ['button:has-text("Accept All Cookies")', "#onetrust-accept-btn-handler"]) {
       const b = page.locator(sel).first();
       if (await b.isVisible().catch(() => false)) { await b.click().catch(() => {}); break; }
     }
-    const signIn = page.locator('a:has-text("Sign In"), button:has-text("Sign In")').first();
-    if (await signIn.isVisible().catch(() => false)) await signIn.click();
     const email = page.locator('input[type="email"], input[name="username"], input[id*="email" i]').first();
-    await email.waitFor({ timeout: 20000 });
+    if (!(await email.isVisible().catch(() => false))) {
+      const signIn = page.locator('a:has-text("Sign In"), button:has-text("Sign In")').first();
+      if (await signIn.isVisible().catch(() => false)) await signIn.click();
+    }
+    await email.waitFor({ timeout: 25000 }).catch(async () => {
+      const body = await page.evaluate(() => document.body?.innerText?.slice(0, 250)).catch(() => "?");
+      throw new Error(`no login form at ${page.url()} :: ${body}`);
+    });
     await email.fill(process.env.FPL_EMAIL);
     await page.locator('input[type="password"]').first().fill(process.env.FPL_PASS);
     const allow = page.locator('button:has-text("Allow All"), #onetrust-accept-btn-handler').first();
