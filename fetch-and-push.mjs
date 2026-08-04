@@ -66,22 +66,37 @@ async function fetchUnderstat(season) {
 async function fetchMyTeam(teamId) {
   if (!process.env.FPL_EMAIL || !process.env.FPL_PASS || !teamId) return null;
   const { chromium } = await import("playwright");
+  const crypto = await import("node:crypto");
+
+  // Own PKCE flow against the PL SSO (PingFederate) — independent of the FPL
+  // SPA's hydration, which behaves differently on CI runners.
+  const CLIENT_ID = "bfcbaf69-aade-4c1b-8f00-c1cb8a193030";
+  const REDIRECT = "https://fantasy.premierleague.com/";
+  const verifier = crypto.randomBytes(48).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const authUrl =
+    "https://account.premierleague.com/as/authorize" +
+    `?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}` +
+    "&response_type=code&scope=openid+profile+email+offline_access" +
+    `&state=${crypto.randomBytes(12).toString("hex")}` +
+    `&code_challenge=${challenge}&code_challenge_method=S256&language=en`;
+
   const browser = await chromium.launch({ headless: true });
   try {
     const ctx = await browser.newContext({ userAgent: UA["User-Agent"] + " Chrome/126.0 Safari/537.36" });
     const page = await ctx.newPage();
-    // /my-team forces a redirect into the account.premierleague.com login flow
-    await page.goto("https://fantasy.premierleague.com/my-team", { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(3000);
-    for (const sel of ['button:has-text("Accept All Cookies")', "#onetrust-accept-btn-handler"]) {
-      const b = page.locator(sel).first();
-      if (await b.isVisible().catch(() => false)) { await b.click().catch(() => {}); break; }
-    }
+
+    // capture the authorization code the moment the SSO redirects back
+    let authCode = null;
+    page.on("request", (req) => {
+      const u = req.url();
+      if (u.startsWith(REDIRECT) && u.includes("code=")) {
+        authCode = new URL(u).searchParams.get("code");
+      }
+    });
+
+    await page.goto(authUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
     const email = page.locator('input[type="email"], input[name="username"], input[id*="email" i]').first();
-    if (!(await email.isVisible().catch(() => false))) {
-      const signIn = page.locator('a:has-text("Sign In"), button:has-text("Sign In")').first();
-      if (await signIn.isVisible().catch(() => false)) await signIn.click();
-    }
     await email.waitFor({ timeout: 25000 }).catch(async () => {
       const body = await page.evaluate(() => document.body?.innerText?.slice(0, 250)).catch(() => "?");
       throw new Error(`no login form at ${page.url()} :: ${body}`);
@@ -91,20 +106,28 @@ async function fetchMyTeam(teamId) {
     const allow = page.locator('button:has-text("Allow All"), #onetrust-accept-btn-handler').first();
     if (await allow.isVisible().catch(() => false)) { await allow.click().catch(() => {}); await page.waitForTimeout(800); }
     await page.locator('button.button--filled:has-text("Sign In")').first().click();
-    await page.waitForURL("https://fantasy.premierleague.com/**", { timeout: 30000 });
-    await page.waitForTimeout(4000); // SPA token exchange
-    const access = await page.evaluate(() => {
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k.startsWith("oidc.user:")) {
-          try { return JSON.parse(localStorage.getItem(k)).access_token ?? null; } catch { return null; }
-        }
-      }
-      return null;
+
+    for (let i = 0; i < 60 && !authCode; i++) await page.waitForTimeout(500);
+    if (!authCode) {
+      const hint = await page.evaluate(() => document.body?.innerText?.slice(0, 200)).catch(() => "?");
+      throw new Error(`no auth code after submit at ${page.url()} :: ${hint}`);
+    }
+
+    const tokenRes = await ctx.request.post("https://account.premierleague.com/as/token", {
+      form: {
+        grant_type: "authorization_code",
+        code: authCode,
+        redirect_uri: REDIRECT,
+        client_id: CLIENT_ID,
+        code_verifier: verifier,
+      },
     });
-    if (!access) throw new Error("no access token after login");
+    if (!tokenRes.ok()) throw new Error(`token exchange -> ${tokenRes.status()}`);
+    const { access_token } = await tokenRes.json();
+    if (!access_token) throw new Error("token exchange returned no access_token");
+
     const res = await ctx.request.get(`${BASE}/my-team/${teamId}/`, {
-      headers: { "X-Api-Authorization": `Bearer ${access}` },
+      headers: { "X-Api-Authorization": `Bearer ${access_token}` },
     });
     if (!res.ok()) throw new Error(`my-team -> ${res.status()}`);
     return await res.json();
