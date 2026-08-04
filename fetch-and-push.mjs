@@ -30,7 +30,46 @@ const PLAYER_FIELDS = [
   "minutes", "ict_index", "expected_goals", "expected_assists",
   "expected_goal_involvements", "expected_goals_conceded", "ep_next",
   "transfers_in_event", "transfers_out_event",
+  "penalties_order", "direct_freekicks_order", "corners_and_indirect_freekicks_order",
 ];
+
+const US_FIELDS = ["player_name", "team_title", "games", "time", "goals", "assists", "xG", "xA", "npxG", "shots", "key_passes"];
+
+// Understat: shot-model xG/xA. Seasons are named by starting year; fetch the
+// current one plus last season (the meaningful sample in preseason/early GWs).
+async function fetchUnderstat(season) {
+  const res = await fetch("https://understat.com/main/getPlayersStats/", {
+    method: "POST",
+    headers: {
+      ...UA,
+      "X-Requested-With": "XMLHttpRequest",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      Referer: `https://understat.com/league/EPL/${season}`,
+    },
+    body: `league=EPL&season=${season}`,
+  });
+  if (!res.ok) throw new Error(`understat ${season} -> ${res.status}`);
+  const j = await res.json();
+  if (!j.success || !Array.isArray(j.players)) throw new Error(`understat ${season}: bad payload`);
+  return {
+    season,
+    players: j.players
+      .filter((p) => (parseInt(p.time) || 0) > 0)
+      .map((p) => Object.fromEntries(US_FIELDS.map((f) => [f, p[f]]))),
+  };
+}
+
+// ClubElo: team strength ratings, one CSV row per club.
+async function fetchElo() {
+  const date = new Date().toISOString().slice(0, 10);
+  const res = await fetch(`http://api.clubelo.com/${date}`);
+  if (!res.ok) throw new Error(`clubelo -> ${res.status}`);
+  const rows = (await res.text()).trim().split("\n").slice(1).map((l) => l.split(","));
+  return rows
+    .filter((r) => r[2] === "ENG")
+    .slice(0, 40)
+    .map((r) => ({ club: r[1], elo: Math.round(parseFloat(r[4])) }));
+}
 
 const relayErrors = [];
 
@@ -45,6 +84,24 @@ const bootstrap = {
   events: bootstrapFull.events.map(({ id, name, deadline_time, finished, is_current, is_next, average_entry_score }) =>
     ({ id, name, deadline_time, finished, is_current, is_next, average_entry_score })),
 };
+
+// Secondary sources — each is best-effort; the monitor renormalises scoring
+// weights over whatever arrives.
+const sources = { understat: [], elo: null };
+const seasonStartYear = new Date().getMonth() >= 6 ? new Date().getFullYear() : new Date().getFullYear() - 1;
+for (const season of [seasonStartYear, seasonStartYear - 1]) {
+  try {
+    const s = await fetchUnderstat(season);
+    if (s.players.length) sources.understat.push(s);
+  } catch (err) {
+    relayErrors.push(`understat: ${err.message}`);
+  }
+}
+try {
+  sources.elo = await fetchElo();
+} catch (err) {
+  relayErrors.push(`clubelo: ${err.message}`);
+}
 
 let entry = null;
 let picks = null;
@@ -67,7 +124,7 @@ if (teamId) {
 const res = await fetch(`${INGEST_BASE}/ingest?key=${KEY}`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ bootstrap, fixtures, entry, picks, relayErrors }),
+  body: JSON.stringify({ bootstrap, fixtures, entry, picks, sources, relayErrors }),
 });
 const out = await res.json().catch(() => ({}));
 console.log(`ingest -> ${res.status}`, JSON.stringify(out));
